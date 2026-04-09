@@ -24,8 +24,19 @@ DB = {"products": {}, "peer_groups": {}, "index_to_codes": {}}
 
 def load_db():
     global DB
-    db_path = os.path.join(os.path.dirname(__file__), "etf_db.json")
-    if os.path.exists(db_path):
+    # 多个路径候选，依次尝试
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "etf_db.json"),
+        os.path.join(os.getcwd(), "etf_db.json"),
+        "etf_db.json",
+        "/app/etf_db.json",
+    ]
+    db_path = None
+    for p in candidates:
+        if os.path.exists(p):
+            db_path = p
+            break
+    if db_path:
         with open(db_path, encoding="utf-8") as f:
             DB = json.load(f)
         print(f"[DB] 加载完成: {len(DB['products'])}只产品, {len(DB['peer_groups'])}组对标")
