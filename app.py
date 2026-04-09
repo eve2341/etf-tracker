@@ -10,10 +10,10 @@ from datetime import datetime, date, timedelta
 import functools
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "phfund2024etf")
+app.secret_key = os.environ.get("SECRET_KEY", "phfund2026etf")
 
 # ── 访问密码（环境变量设置，默认 penghua2024） ──
-ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "penghua2024")
+ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "etfgogogo")
 
 # ── 全局缓存 ──
 cache = {
