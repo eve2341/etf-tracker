@@ -18,6 +18,12 @@ def _dec(b):
 
 _SLIM=_dec(S); _IDX=_dec(I); _CAT=_dec(C)
 PRODUCTS=_SLIM.get('products',{})
+# 清理category字段（去掉换行/首发日期等脏数据）
+for _code,_p in PRODUCTS.items():
+    cat=_p.get('category','') or ''
+    import re as _re
+    cat=_re.sub(r'[\n\r].*','',cat).split('（')[0].split('(')[0].strip()
+    _p['category']=cat
 IDX_TO_CODES=_IDX  # index_name -> [{code,name,manager}]
 CODE_TO_CAT=_CAT.get('code_to_cat',{})
 CAT_TO_ALL=_CAT.get('cat_to_all',{})
@@ -88,22 +94,44 @@ def fetch_spot():
         if len(df)>0:
             row0=df.iloc[0]
             print(f"[spot] 第一行: { {col:str(row0[col])[:15] for col in df.columns} }")
+        # 获取数据日期（用于标注）
+        data_date = ""
+        if len(df) > 0:
+            raw_date = str(df.iloc[0].get("数据日期",""))
+            if raw_date and raw_date != "nan":
+                # 格式：2026-04-10 00:00，取日期部分并推算
+                try:
+                    from datetime import datetime as _dt, timedelta as _td
+                    d = _dt.strptime(raw_date[:10], "%Y-%m-%d").date()
+                    data_date = d.strftime("%m月%d日")
+                except:
+                    data_date = raw_date[:10]
+        print(f"[spot] 数据日期: {data_date}")
+
         r={}
         for _,row in df.iterrows():
             c=str(row.get("代码","")).strip()
             if not c: continue
-            price=sf(row.get("最新价",row.get("现价",row.get("收盘价"))))
-            pct=sf(row.get("涨跌幅",row.get("日增长率")))
-            prem=sf(row.get("折溢价率",row.get("基金折价率",row.get("溢价率"))))
+            price=sf(row.get("最新价"))
+            pct=sf(row.get("涨跌幅"))
+            prem=sf(row.get("基金折价率"))
+            # 最新份额（份）× 最新价 ÷ 1亿 = 规模（亿）
+            shares=sf(row.get("最新份额"))
+            if shares and price and shares > 0 and price > 0:
+                aum=round(shares * price / 1e8, 2)
+            else:
+                # fallback：总市值（元）÷ 1亿
+                mktcap=sf(row.get("总市值"))
+                aum=round(mktcap/1e8,2) if mktcap and mktcap>0 else None
+            # 成交额（元）转亿
             raw_vol=sf(row.get("成交额",0)) or 0
-            vol_yi=round(raw_vol/1e8,2) if raw_vol>1e6 else (raw_vol if raw_vol>0 else None)
-            aum=sf(row.get("规模",row.get("规模(亿)",row.get("基金规模(亿元)",row.get("资产净值")))))
-            shares=sf(row.get("基金份额(万份)",row.get("份额",row.get("总份额",row.get("基金份额")))))
-            if aum is None and shares and price:
-                aum=round(shares*price/10000,2)
+            vol_yi=round(raw_vol/1e8,2) if raw_vol and raw_vol>1e4 else None
             r[c]={"price":price,"pct_chg":pct,"premium":prem,
                   "turnover_yi":vol_yi,"aum":aum,"shares":shares}
-        print(f"[spot] {len(r)}只，aum非空: {sum(1 for v in r.values() if v.get('aum'))}")
+        aum_count=sum(1 for v in r.values() if v.get('aum'))
+        print(f"[spot] {len(r)}只，规模非空: {aum_count}")
+        # 把数据日期存到全局供前端显示
+        import builtins; builtins._SPOT_DATE = data_date
         return r
     except Exception as e:
         print(f"[spot] 失败: {e}"); return {}
@@ -111,42 +139,63 @@ def fetch_spot():
 def fetch_perf(code):
     if not code or code.startswith(('HS','DJI','SP','CN')): return None
     try:
-        import akshare as ak,pandas as pd
+        import akshare as ak
+        import pandas as pd
+        import numpy as np
         end=date.today()
         df=ak.index_zh_a_hist(symbol=code,period="daily",
             start_date=end.replace(year=end.year-1).strftime("%Y%m%d"),
             end_date=end.strftime("%Y%m%d"))
         if df is None or df.empty: return None
-        df=df.sort_values("日期"); c=df["收盘"].values
+        df=df.sort_values("日期")
+        c=df["收盘"].astype(float).values
         def r(n): return round((c[-1]/c[-n]-1)*100,2) if len(c)>=n else None
-        roll=pd.Series(c).cummax(); dd=round(((pd.Series(c)-roll)/roll).min()*100,2)
-        mi=pd.Series(c).idxmin()
+        roll=pd.Series(c).cummax()
+        dd=round(((pd.Series(c)-roll)/roll).min()*100,2)
+        mi=int(pd.Series(c).idxmin())
         bounce=round((c[-1]/c[mi]-1)*100,2) if mi<len(c)-1 else 0
         return {"ret_1m":r(22),"ret_3m":r(63),"ret_6m":r(126),"ret_1y":r(252),
                 "max_dd":dd,"bounce":bounce}
-    except: return None
+    except Exception as e:
+        print(f"[perf] {code}: {e}")
+        return None
 
 def fetch_cons(idx_code):
     """拉指数成分股权重（仅A股中证/国证指数）"""
     if not idx_code or idx_code.startswith(('HS','DJI','SP')): return {}
     try:
         import akshare as ak
+        import pandas as pd
         df=None
-        try: df=ak.index_stock_cons_weight_csindex(symbol=idx_code)
-        except: pass
+        # 方式1：中证指数带权重接口
+        try:
+            df=ak.index_stock_cons_weight_csindex(symbol=idx_code)
+            print(f"[cons] {idx_code} csindex权重接口列名: {list(df.columns) if df is not None else 'None'}")
+        except Exception as e1:
+            print(f"[cons] {idx_code} csindex失败: {e1}")
+        # 方式2：通用成分股接口
         if df is None or df.empty:
-            try: df=ak.index_stock_cons(symbol=idx_code)
-            except: pass
+            try:
+                df=ak.index_stock_cons(symbol=idx_code)
+                print(f"[cons] {idx_code} 通用接口列名: {list(df.columns) if df is not None else 'None'}")
+            except Exception as e2:
+                print(f"[cons] {idx_code} 通用接口失败: {e2}")
         if df is None or df.empty: return {}
         # 统一列名
-        for old,new in [("成分券名称","name"),("股票名称","name"),
-                        ("权重(%)","weight"),("权重","weight"),("占比","weight")]:
-            if old in df.columns: df=df.rename(columns={old:new})
-        if "weight" not in df.columns: df["weight"]=100/len(df)
-        df["weight"]=pd.to_numeric(df["weight"].astype(str).str.replace("%",""),errors="coerce").fillna(0)
+        col_map={"成分券名称":"name","股票名称":"name","品种名称":"name",
+                 "权重(%)":"weight","权重":"weight","占比":"weight"}
+        for old_col,new_col in col_map.items():
+            if old_col in df.columns: df=df.rename(columns={old_col:new_col})
+        if "weight" not in df.columns:
+            df["weight"]=round(100/len(df),2)
+        df["weight"]=pd.to_numeric(
+            df["weight"].astype(str).str.replace("%","").str.strip(),
+            errors="coerce").fillna(0)
         df=df.sort_values("weight",ascending=False)
-        top10=[{"name":str(row.get("name","")),"weight":round(float(row.get("weight",0)),2)}
+        top10=[{"name":str(row.get("name",row.get("成分券名称",row.get("股票名称","")))),
+                "weight":round(float(row.get("weight",0)),2)}
                for _,row in df.head(10).iterrows()]
+        print(f"[cons] {idx_code} 成功，前3: {top10[:3]}")
         return {"top10":top10,"date":date.today().isoformat(),"total":len(df)}
     except Exception as e:
         print(f"[cons] {idx_code}: {e}"); return {}
@@ -202,7 +251,10 @@ def api_refresh():
 @app.route("/api/status")
 @lr
 def api_status():
-    with LK: return jsonify({"status":C_["status"],"last_update":C_["last_update"],"error":C_["error"]})
+    import builtins
+    spot_date = getattr(builtins, '_SPOT_DATE', '')
+    with LK: return jsonify({"status":C_["status"],"last_update":C_["last_update"],
+                             "error":C_["error"],"spot_date":spot_date})
 
 @app.route("/api/products")
 @lr
@@ -473,7 +525,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:#faf9f7}
     <div class="card">
       <div class="ch"><span class="ct">全部产品</span><span class="cm" id="ov-cnt2"></span></div>
       <div style="overflow-x:auto">
-      <table><thead><tr><th>产品名称</th><th>代码</th><th>板块</th><th>今日涨跌</th><th>折溢价率</th><th>实时规模(亿)</th><th>成交额(亿)</th><th>同指数排名</th><th>独家</th></tr></thead>
+      <table><thead><tr><th>产品名称</th><th>代码</th><th>板块</th><th>今日涨跌</th><th>折溢价率</th><th>规模估算(亿)</th><th>成交额(亿)</th><th>同指数排名</th><th>独家</th></tr></thead>
       <tbody id="ov-body"><tr><td colspan="9" style="text-align:center;padding:36px;color:var(--mu)">点击「刷新数据」加载</td></tr></tbody></table>
       </div>
     </div>
@@ -802,7 +854,7 @@ function expCsv(){
 
 window.onload=async()=>{
   const s=await fetch('/api/status').then(r=>r.json());
-  if(s.status==='ok'){setSt('ok','数据正常');document.getElementById('upd').textContent=s.last_update||'';await loadProds()}
+  if(s.status==='ok'){setSt('ok','数据正常');document.getElementById('upd').textContent=(s.last_update||'')+(s.spot_date?' · 规模截至'+s.spot_date:'');await loadProds()}
   else{setSt('idle','待加载');doRefresh()}
 };
 </script></body></html>"""
