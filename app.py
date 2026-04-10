@@ -1,4 +1,12 @@
 """鹏华ETF AI营销平台 v8 - 已验证接口版本"""
+import os
+# 绕过系统代理（关掉代理后此设置确保Python不走任何代理）
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
 from flask import Flask,jsonify,render_template_string,request,session,redirect
 import threading,time,os,json,functools,re,base64
 from datetime import datetime,date
@@ -18,11 +26,19 @@ def _dec(b):
 
 _SLIM=_dec(S); _IDX=_dec(I); _CAT=_dec(C)
 PRODUCTS=_SLIM.get('products',{})
+# 清理category字段（去掉换行/首发日期等脏数据，如"港美股\n2026.3.23首发"→"港美股"）
+import re as _re
+for _code,_p in PRODUCTS.items():
+    cat = _p.get('category','') or ''
+    cat = _re.sub(r'[\n\r].*','',cat).split('（')[0].split('(')[0].strip()
+    _p['category'] = cat
 # 清理category字段（去掉换行/首发日期等脏数据）
 for _code,_p in PRODUCTS.items():
     cat=_p.get('category','') or ''
-    import re as _re
-    cat=_re.sub(r'[\n\r].*','',cat).split('（')[0].split('(')[0].strip()
+    # 去掉换行后的内容（如"港美股\n2026.3.23首发" -> "港美股"）
+    if '\n' in cat: cat = cat.split('\n')[0].strip()
+    if '（' in cat: cat = cat.split('（')[0].strip()
+    if '(' in cat: cat = cat.split('(')[0].strip()
     _p['category']=cat
 IDX_TO_CODES=_IDX  # index_name -> [{code,name,manager}]
 CODE_TO_CAT=_CAT.get('code_to_cat',{})
@@ -137,66 +153,86 @@ def fetch_spot():
         print(f"[spot] 失败: {e}"); return {}
 
 def fetch_perf(code):
+    """拉指数历史行情，计算各周期收益"""
     if not code or code.startswith(('HS','DJI','SP','CN')): return None
     try:
         import akshare as ak
         import pandas as pd
-        import numpy as np
-        end=date.today()
-        df=ak.index_zh_a_hist(symbol=code,period="daily",
-            start_date=end.replace(year=end.year-1).strftime("%Y%m%d"),
-            end_date=end.strftime("%Y%m%d"))
+        from datetime import date as _date
+        end = _date.today()
+        start = end.replace(year=end.year-2)
+        df = ak.index_zh_a_hist(
+            symbol=code, period="daily",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d")
+        )
         if df is None or df.empty: return None
-        df=df.sort_values("日期")
-        c=df["收盘"].astype(float).values
-        def r(n): return round((c[-1]/c[-n]-1)*100,2) if len(c)>=n else None
-        roll=pd.Series(c).cummax()
-        dd=round(((pd.Series(c)-roll)/roll).min()*100,2)
-        mi=int(pd.Series(c).idxmin())
-        bounce=round((c[-1]/c[mi]-1)*100,2) if mi<len(c)-1 else 0
-        return {"ret_1m":r(22),"ret_3m":r(63),"ret_6m":r(126),"ret_1y":r(252),
-                "max_dd":dd,"bounce":bounce}
+        df = df.sort_values("日期")
+        c = df["收盘"].astype(float).values
+        if len(c) < 2: return None
+        def r(n): return round((c[-1]/c[-n]-1)*100, 2) if len(c) >= n else None
+        c1y = c[-252:] if len(c) >= 252 else c
+        cs = pd.Series(c1y)
+        roll = cs.cummax()
+        dd = round(((cs - roll) / roll).min() * 100, 2)
+        mi = int(cs.idxmin())
+        bounce = round((c1y[-1]/c1y[mi]-1)*100, 2) if mi < len(c1y)-1 else 0
+        return {
+            "ret_1m": r(22), "ret_3m": r(63),
+            "ret_6m": r(126), "ret_1y": r(252),
+            "max_dd": dd, "bounce": bounce
+        }
     except Exception as e:
         print(f"[perf] {code}: {e}")
         return None
 
 def fetch_cons(idx_code):
-    """拉指数成分股权重（仅A股中证/国证指数）"""
+    """拉指数成分股权重"""
     if not idx_code or idx_code.startswith(('HS','DJI','SP')): return {}
     try:
         import akshare as ak
         import pandas as pd
-        df=None
-        # 方式1：中证指数带权重接口
+        # 方式1：中证权重接口（akshare>=1.18.54有权重列，值为小数如0.442表示0.442%）
         try:
-            df=ak.index_stock_cons_weight_csindex(symbol=idx_code)
-            print(f"[cons] {idx_code} csindex权重接口列名: {list(df.columns) if df is not None else 'None'}")
+            df = ak.index_stock_cons_weight_csindex(symbol=idx_code)
+            if df is not None and not df.empty and '权重' in df.columns:
+                df = df.rename(columns={'成分券名称': 'name', '权重': 'weight'})
+                df['weight'] = pd.to_numeric(df['weight'], errors='coerce').fillna(0)
+                df = df.sort_values('weight', ascending=False)
+                top10 = [{"name": str(row['name']), "weight": round(float(row['weight']), 3)}
+                         for _, row in df.head(10).iterrows()]
+                report_date = str(df.iloc[0].get('日期', date.today()))[:10]
+                print(f"[cons] {idx_code} 权重接口OK，前3: {top10[:3]}")
+                return {"top10": top10, "date": report_date, "total": len(df)}
         except Exception as e1:
-            print(f"[cons] {idx_code} csindex失败: {e1}")
-        # 方式2：通用成分股接口
-        if df is None or df.empty:
-            try:
-                df=ak.index_stock_cons(symbol=idx_code)
-                print(f"[cons] {idx_code} 通用接口列名: {list(df.columns) if df is not None else 'None'}")
-            except Exception as e2:
-                print(f"[cons] {idx_code} 通用接口失败: {e2}")
-        if df is None or df.empty: return {}
-        # 统一列名
-        col_map={"成分券名称":"name","股票名称":"name","品种名称":"name",
-                 "权重(%)":"weight","权重":"weight","占比":"weight"}
-        for old_col,new_col in col_map.items():
-            if old_col in df.columns: df=df.rename(columns={old_col:new_col})
-        if "weight" not in df.columns:
-            df["weight"]=round(100/len(df),2)
-        df["weight"]=pd.to_numeric(
-            df["weight"].astype(str).str.replace("%","").str.strip(),
-            errors="coerce").fillna(0)
-        df=df.sort_values("weight",ascending=False)
-        top10=[{"name":str(row.get("name",row.get("成分券名称",row.get("股票名称","")))),
-                "weight":round(float(row.get("weight",0)),2)}
-               for _,row in df.head(10).iterrows()]
-        print(f"[cons] {idx_code} 成功，前3: {top10[:3]}")
-        return {"top10":top10,"date":date.today().isoformat(),"total":len(df)}
+            print(f"[cons] {idx_code} 权重接口失败: {e1}")
+        # 方式2：中证成分股接口（无权重，等权）
+        try:
+            df = ak.index_stock_cons_csindex(symbol=idx_code)
+            if df is not None and not df.empty:
+                df = df.rename(columns={'成分券名称': 'name'})
+                n = len(df)
+                top10 = [{"name": str(row.get('name', '')), "weight": round(100/n, 2)}
+                         for _, row in df.head(10).iterrows()]
+                print(f"[cons] {idx_code} 等权接口OK，共{n}只")
+                return {"top10": top10, "date": date.today().isoformat(),
+                        "total": n, "equal_weight": True}
+        except Exception as e2:
+            print(f"[cons] {idx_code} 等权接口失败: {e2}")
+        # 方式3：通用成分股接口
+        try:
+            df = ak.index_stock_cons(symbol=idx_code)
+            if df is not None and not df.empty:
+                n = len(df)
+                col = '品种名称' if '品种名称' in df.columns else df.columns[1]
+                top10 = [{"name": str(row.get(col, '')), "weight": round(100/n, 2)}
+                         for _, row in df.head(10).iterrows()]
+                print(f"[cons] {idx_code} 通用接口OK，共{n}只")
+                return {"top10": top10, "date": date.today().isoformat(),
+                        "total": n, "equal_weight": True}
+        except Exception as e3:
+            print(f"[cons] {idx_code} 通用接口失败: {e3}")
+        return {}
     except Exception as e:
         print(f"[cons] {idx_code}: {e}"); return {}
 
@@ -220,16 +256,22 @@ def fetch_all():
             peers.sort(key=lambda x:x["aum"] or 0,reverse=True)
             peer_aum[idx_name]=peers
 
-        # 3. 指数历史行情（并发，跳过港股海外）
+        # 3. 指数历史行情（并发拉取，跳过港股海外）
+        # 3. 指数历史行情（本地环境串行拉取；Railway跳过）
         print("[3/3] 拉取指数历史...")
-        codes_to_fetch={v for k,v in INDEX_CODE.items() if k not in HK_INDICES}
-        index_perf={}
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            futs={ex.submit(fetch_perf,ic):ic for ic in list(codes_to_fetch)[:40]}
-            for fut in as_completed(futs):
-                ic=futs[fut]; r=fut.result()
-                if r: index_perf[ic]=r
-        print(f"      获取{len(index_perf)}个指数")
+        # 通过PORT环境变量判断是否在Railway/云端（云端PORT由平台注入）
+        is_cloud = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
+        if is_cloud:
+            print("      云端环境，跳过指数历史（中国数据源访问受限）")
+            index_perf = {}
+        else:
+            codes_to_fetch = list({v for k,v in INDEX_CODE.items() if k not in HK_INDICES and v})
+            index_perf = {}
+            for ic in codes_to_fetch[:40]:
+                r = fetch_perf(ic)
+                if r: index_perf[ic] = r
+                time.sleep(0.3)
+            print(f"      获取{len(index_perf)}个指数")
 
         with LK:
             C_["spot"]=spot; C_["peer_aum"]=peer_aum; C_["index_perf"]=index_perf
@@ -590,7 +632,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:#faf9f7}
     <div class="card" id="d-dyn-card" style="display:none">
       <div class="ch"><span class="ct">动态竞品对比</span><span class="cm">同指数规模前2名</span></div>
       <div style="overflow-x:auto">
-      <table><thead><tr><th>产品</th><th>管理人</th><th>实时规模(亿)</th><th>折溢价率</th><th>今日涨跌</th></tr></thead>
+      <table><thead><tr><th>产品</th><th>管理人</th><th>跟踪指数</th><th>实时规模(亿)</th><th>折溢价率</th><th>今日涨跌</th></tr></thead>
       <tbody id="d-dyn"></tbody></table>
       </div>
     </div>
@@ -725,17 +767,33 @@ async function loadD(code){
 
   // 指数表现
   document.getElementById('d-idx-l').textContent=(data.index_name||'')+' ('+(data.index_code||'')+')';
-  if(data.is_hk){
-    document.getElementById('d-idx').innerHTML='<div class="mu-t">港股/海外指数历史行情暂不支持，请前往恒生指数公司官网查询</div>';
-  } else if(Object.keys(idx).length){
-    document.getElementById('d-idx').innerHTML=
-      `<div class="perf6">`+
-      [['近1月',idx.ret_1m],['近3月',idx.ret_3m],['近6月',idx.ret_6m],['近1年',idx.ret_1y],
-       ['最大回撤',idx.max_dd,true],['低点弹性',idx.bounce]].map(([l,v,neg])=>
-        `<div class="mc" style="padding:8px 10px"><div class="ml">${l}</div><div class="mv" style="font-size:15px">${
-          v!=null?(neg?`<span class="dn">${v.toFixed(2)}%</span>`:fp(v)):'—'}</div></div>`).join('')+`</div>`;
-  } else {
-    document.getElementById('d-idx').innerHTML='<div class="mu-t">请先刷新数据</div>';
+  // 指数历史行情
+  {
+    const idxN = data.index_name||'';
+    const idxCode = data.index_code||'';
+    if(data.is_hk || idxN.includes('道琼斯') || idxN.includes('标普')){
+      let url = data.is_hk||idxN.includes('恒生') ? 'https://www.hsi.com.hk' :
+                'https://www.spglobal.com/spdji/en/';
+      document.getElementById('d-idx').innerHTML=`<div style="color:var(--mu);font-size:13px;margin-bottom:8px">港股/海外指数请前往官网查询</div>
+        <a href="${url}" target="_blank" class="btn" style="font-size:12px;text-decoration:none">🔗 前往官网</a>`;
+    } else if(Object.keys(idx).length){
+      document.getElementById('d-idx').innerHTML=
+        `<div class="perf6">`+
+        [['近1月',idx.ret_1m],['近3月',idx.ret_3m],['近6月',idx.ret_6m],['近1年',idx.ret_1y],
+         ['最大回撤',idx.max_dd,true],['低点弹性',idx.bounce]].map(([l,v,neg])=>
+          `<div class="mc" style="padding:8px 10px"><div class="ml">${l}</div><div class="mv" style="font-size:15px">${
+            v!=null?(neg?`<span class="dn">${v.toFixed(2)}%</span>`:fp(v)):'—'}</div></div>`).join('')+`</div>`;
+    } else {
+      // 无历史数据：显示官网外链
+      let site2='https://www.csindex.com.cn', siteName2='中证指数官网';
+      if(idxN.startsWith('国证')||idxN.includes('国证')){site2='https://www.cnindex.com.cn';siteName2='国证指数官网';}
+      document.getElementById('d-idx').innerHTML=`
+        <div style="color:var(--mu);font-size:13px;margin-bottom:10px">历史行情请前往指数官网查询</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <a href="${site2}" target="_blank" class="btn" style="font-size:12px;text-decoration:none">🔗 ${siteName2}</a>
+          ${idxCode?`<a href="https://www.csindex.com.cn/zh-CN/indices/index-detail/${idxCode}" target="_blank" class="btn" style="font-size:12px;text-decoration:none">📊 ${esc(idxN)}</a>`:''}
+        </div>`;
+    }
   }
 
   // 成分股
@@ -764,26 +822,38 @@ async function loadD(code){
   // 动态竞品
   if(dyn.length){
     document.getElementById('d-dyn-card').style.display='block';
+    // 查询竞品的跟踪指数名称
+    const peerIndexMap = {};
+    (data.peers_rt||[]).forEach(pe => {
+      // 通过产品代码在全局产品列表中找跟踪指数
+      const prod = allP.find(p=>p.code===pe.code);
+      peerIndexMap[pe.code] = prod ? (prod.index_name||'—') : '—';
+    });
     document.getElementById('d-dyn').innerHTML=dyn.map(pe=>`<tr>
-      <td><b>${esc(pe.name)}</b></td><td style="font-size:11px;color:var(--mu)">${esc(pe.manager||'—')}</td>
+      <td><b>${esc(pe.name)}</b></td>
+      <td style="font-size:11px;color:var(--mu)">${esc(pe.manager||'—')}</td>
+      <td style="font-size:11px;color:var(--mu)">${esc(peerIndexMap[pe.code]||'—')}</td>
       <td style="font-family:var(--mono)">${pe.aum?pe.aum.toFixed(2):'—'}</td>
       <td>${fp(pe.premium)}</td><td>${fp(pe.pct_chg)}</td></tr>`).join('');
   }
 }
 
 function rCons(cons){
-  document.getElementById('d-cons-l').textContent='更新: '+cons.date;
+  document.getElementById('d-cons-l').textContent='更新: '+cons.date+(cons.equal_weight?' · 等权（无权重数据）':'');
   const top10=cons.top10||[];
-  document.getElementById('d-cons').innerHTML=top10.length?
-    `<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px">`+
-    [top10.slice(0,5),top10.slice(5,10)].map(half=>
-      `<div>${half.map((s,i)=>`<div class="bar-r">
-        <span style="color:var(--mu);font-family:var(--mono);font-size:10px;min-width:14px">${(half===top10.slice(0,5)?i+1:i+6)}</span>
-        <span style="min-width:70px;font-size:12px">${esc(s.name)}</span>
-        <div class="bar-bg"><div class="bar-f" style="width:${Math.min(s.weight*5,100)}%"></div></div>
-        <span style="font-family:var(--mono);font-size:11px;min-width:36px;text-align:right">${s.weight.toFixed(2)}%</span>
-      </div>`).join('')}</div>`).join('')+`</div>`:
-    '<div class="mu-t">成分股数据暂无</div>';
+  document.getElementById('d-cons').innerHTML=top10.length?(()=>{
+    const hasW=cons.has_weight;
+    const left=top10.slice(0,5), right=top10.slice(5,10);
+    const half2html=h=>h.map(s=>`<div class="bar-r">
+      <span style="color:var(--mu);font-family:var(--mono);font-size:10px;min-width:18px">${s.rank}</span>
+      <span style="min-width:72px;font-size:12px">${esc(s.name)}</span>
+      <div class="bar-bg"><div class="bar-f" style="width:${hasW&&s.weight?Math.min(s.weight*5,100):0}%"></div></div>
+      <span style="font-family:var(--mono);font-size:11px;min-width:40px;text-align:right">${hasW&&s.weight?s.weight.toFixed(2)+'%':'—'}</span>
+    </div>`).join('');
+    return `<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px">
+      <div>${half2html(left)}</div><div>${half2html(right)}</div></div>
+      ${!hasW?'<div style="font-size:11px;color:var(--mu);margin-top:8px">⚠️ 该指数暂无权重数据，仅显示成分股名称</div>':''}`;
+  })():'<div class="mu-t">成分股数据暂无</div>';
 }
 
 function pollCons(idxCode){
