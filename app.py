@@ -47,7 +47,7 @@ ALL_NAME=_CAT.get('all_code_name',{})
 ALL_MGR=_CAT.get('all_code_manager',{})
 
 # 指数名称->代码（用于拉历史行情）
-# 指数名称->新浪代码（用于拉历史行情，新浪接口全球可访问）
+# 指数名称->新浪/东财代码（新浪用于000xxx/399xxx，东财支持所有包括930xxx系列）
 INDEX_CODE={
     "沪深300":"sh000300","中证500":"sh000905","中证1000":"sh000852","中证800":"sh000906",
     "中证A500":"sh000510","中证A50":"sh000050","中证国防":"sz399973","中证银行":"sz399986",
@@ -56,17 +56,35 @@ INDEX_CODE={
     "云计算":"sh930851","工业互联":"sh931142","CS车联网":"sh930899","细分化工":"sh000813",
     "全指公用":"sh000270","内地低碳":"sz399989","科创50":"sh000688","科创100":"sh000698",
     "科创200":"sh000699","科创综指":"sh000681","科创创业AI":"sh932000","科创新能":"sh000692",
-    "科创生物":"sh000683","科创芯片":"sh000685","科创芯片设计":"sh950125","创业板综":"sz399102",
+    "科创生物":"sh000683","科创芯片":"sh000685","科创AI":"sh000685","创业板综":"sz399102",
     "创业板50":"sz399673","创新能源":"sz399814","国证有色":"sz399395","国证粮食":"sz399294",
     "国证油气":"sz399308","证券龙头":"sz399437","工业有色":"sh930708","食品":"sh000998",
     "消费电子":"sz399994","疫苗生科":"sz399998","港股通科技":"sh931573","港股通消费":"sh931454",
     "港股通医药C":"sh930965","港股通创新药":"sh931787","ESG 300":"sh931463","上证180":"sh000010",
     "国证芯片(CNI)":"sz980017","中证800证保":"sz399966","中证电信":"sh930901",
     "卫星产业":"sh932209","通用航空":"sh932210","工程机械主题":"sh931244","金融科技":"sz399699",
-    "科创AI":"sh000685",
+    "科创芯片设计":"sh950125","科创半导体材料设备":"sh950125",
 }
-# 也保留纯数字代码映射（用于成分股接口）
+# 纯数字代码（用于成分股接口）
 INDEX_CODE_NUM={k:v[2:] for k,v in INDEX_CODE.items()}
+# 所有指数的纯数字代码（含930xxx系列，仅用于成分股）
+INDEX_CODE_ALL={
+    "沪深300":"000300","中证500":"000905","中证1000":"000852","中证800":"000906",
+    "中证A500":"000510","中证A50":"000050","中证国防":"399973","中证银行":"399986",
+    "中证传媒":"399971","中证酒":"930782","中证中药":"000978","中证畜牧":"931579",
+    "中证现金流":"932365","800现金流":"932368","光伏产业":"931151","机器人产业":"980032",
+    "云计算":"930851","工业互联":"931142","CS车联网":"930899","细分化工":"000813",
+    "全指公用":"000270","内地低碳":"399989","科创50":"000688","科创100":"000698",
+    "科创200":"000699","科创综指":"000681","科创创业AI":"932000","科创新能":"000692",
+    "科创生物":"000683","科创芯片":"000685","科创芯片设计":"950125","创业板综":"399102",
+    "创业板50":"399673","创新能源":"399814","国证有色":"399395","国证粮食":"399294",
+    "国证油气":"399308","证券龙头":"399437","工业有色":"930708","食品":"000998",
+    "消费电子":"399994","疫苗生科":"399998","港股通科技":"931573","港股通消费":"931454",
+    "港股通医药C":"930965","港股通创新药":"931787","ESG 300":"931463","上证180":"000010",
+    "国证芯片(CNI)":"980017","中证800证保":"399966","中证电信":"930901",
+    "卫星产业":"932209","通用航空":"932210","工程机械主题":"931244","金融科技":"399699",
+    "科创AI":"000685","中证A100":"000852","科创半导体材料设备":"950125",
+}
 HK_INDICES={"恒生科技","恒生指数","恒生生物科技","恒生中国央企指数","道琼斯工业平均",
             "标普港股通低波红利指数(港币)"}
 
@@ -155,30 +173,64 @@ def fetch_spot():
     except Exception as e:
         print(f"[spot] 失败: {e}"); return {}
 
-def fetch_perf(sina_code):
-    """用新浪接口拉指数历史行情（全球可访问）"""
-    if not sina_code or sina_code in ('','None'): return None
-    # 跳过港股/海外
-    if not sina_code.startswith(('sh','sz')): return None
+def fetch_perf(sina_code, idx_name=""):
+    """拉指数历史行情，双接口备选：新浪 + 东方财富原始API"""
+    if not sina_code or not sina_code.startswith(('sh','sz')): return None
     try:
         import akshare as ak
         import pandas as pd
-        df = ak.stock_zh_index_daily(symbol=sina_code)
-        if df is None or df.empty: return None
-        df = df.sort_values("date")
-        c = df["close"].astype(float).values
-        if len(c) < 5: return None
-        def r(n): return round((c[-1]/c[-n]-1)*100,2) if len(c)>=n else None
-        c1y = c[-252:] if len(c)>=252 else c
-        cs = pd.Series(c1y); roll = cs.cummax()
-        dd = round(((cs-roll)/roll).min()*100,2)
-        mi = int(cs.idxmin())
-        bounce = round((c1y[-1]/c1y[mi]-1)*100,2) if mi<len(c1y)-1 else 0
-        return {"ret_1m":r(22),"ret_3m":r(63),"ret_6m":r(126),"ret_1y":r(252),
-                "max_dd":dd,"bounce":bounce}
+        # 方式1：新浪接口（000xxx/399xxx系列支持好）
+        try:
+            df = ak.stock_zh_index_daily(symbol=sina_code)
+            if df is not None and not df.empty and len(df) > 20:
+                df = df.sort_values("date")
+                c = df["close"].astype(float).values
+                return _calc_perf(c)
+        except Exception as e1:
+            print(f"[perf] {sina_code} 新浪失败: {e1}")
+        # 方式2：东方财富原始API（支持930xxx等行业指数）
+        try:
+            from datetime import date as _d
+            end = _d.today()
+            start = end.replace(year=end.year-2)
+            # 东财指数代码格式：1.000300(沪) 0.399973(深)
+            mkt = "1" if sina_code.startswith("sh") else "0"
+            num = sina_code[2:]
+            url = (f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
+                   f"?secid={mkt}.{num}&fields1=f1,f2,f3,f4,f5,f6"
+                   f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+                   f"&klt=101&fqt=1&beg={start.strftime('%Y%m%d')}&end={end.strftime('%Y%m%d')}")
+            import urllib.request, json as _json, ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0","Referer":"https://finance.eastmoney.com/"})
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                data = _json.loads(resp.read())
+            klines = (data.get("data") or {}).get("klines", [])
+            if klines and len(klines) > 20:
+                c = [float(k.split(",")[2]) for k in klines]
+                print(f"[perf] {sina_code} 东财OK，{len(c)}条")
+                return _calc_perf(c)
+        except Exception as e2:
+            print(f"[perf] {sina_code} 东财失败: {e2}")
+        return None
     except Exception as e:
         print(f"[perf] {sina_code}: {e}")
         return None
+
+def _calc_perf(c):
+    """从收盘价序列计算各期收益"""
+    import pandas as pd
+    if not c or len(c) < 5: return None
+    def r(n): return round((c[-1]/c[-n]-1)*100, 2) if len(c) >= n else None
+    c1y = c[-252:] if len(c) >= 252 else c
+    cs = pd.Series(c1y); roll = cs.cummax()
+    dd = round(((cs-roll)/roll).min()*100, 2)
+    mi = int(cs.idxmin())
+    bounce = round((c1y[-1]/c1y[mi]-1)*100, 2) if mi < len(c1y)-1 else 0
+    return {"ret_1m":r(22),"ret_3m":r(63),"ret_6m":r(126),"ret_1y":r(252),
+            "max_dd":dd,"bounce":bounce}
 
 def fetch_cons(idx_code):
     """拉指数成分股权重"""
@@ -320,7 +372,7 @@ def api_product(code):
         sp=C_["spot"].get(code,{}); idx=p.get("index_name","")
         peers_rt=C_["peer_aum"].get(idx,[])
         idx_sina=INDEX_CODE.get(idx,"")
-        idx_code=INDEX_CODE_NUM.get(idx,"")  # 纯数字代码，用于成分股接口
+        idx_code=INDEX_CODE_ALL.get(idx,"")  # 纯数字代码（含930xxx），用于成分股接口
         idx_perf=C_["index_perf"].get(idx_sina,{})
         cons=C_["index_cons"].get(idx_code,{})
     # 同类排名
@@ -380,7 +432,7 @@ def api_ai(code):
     with LK:
         sp=C_["spot"].get(code,{}); idx=p.get("index_name","")
         idx_sina=INDEX_CODE.get(idx,"")
-        idx_code=INDEX_CODE_NUM.get(idx,"")
+        idx_code=INDEX_CODE_ALL.get(idx,"")
         perf=C_["index_perf"].get(idx_sina,{})
         cons=C_["index_cons"].get(idx_code,{})
         peers=C_["peer_aum"].get(idx,[])
@@ -785,7 +837,7 @@ async function loadD(code){
       let site2='https://www.csindex.com.cn', siteName2='中证指数官网';
       if(idxN.startsWith('国证')||idxN.includes('国证')){site2='https://www.cnindex.com.cn';siteName2='国证指数官网';}
       document.getElementById('d-idx').innerHTML=`
-        <div style="color:var(--mu);font-size:13px;margin-bottom:10px">历史行情请前往指数官网查询</div>
+        <div style="color:var(--mu);font-size:13px;margin-bottom:10px">历史行情加载中，请稍后刷新</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <a href="${site2}" target="_blank" class="btn" style="font-size:12px;text-decoration:none">🔗 ${siteName2}</a>
           ${idxCode?`<a href="https://www.csindex.com.cn/zh-CN/indices/index-detail/${idxCode}" target="_blank" class="btn" style="font-size:12px;text-decoration:none">📊 ${esc(idxN)}</a>`:''}
