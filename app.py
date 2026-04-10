@@ -84,18 +84,26 @@ def fetch_spot():
     try:
         import akshare as ak
         df=ak.fund_etf_spot_em()
+        print(f"[spot] 全部列名({len(df.columns)}列): {list(df.columns)}")
+        if len(df)>0:
+            row0=df.iloc[0]
+            print(f"[spot] 第一行: { {col:str(row0[col])[:15] for col in df.columns} }")
         r={}
         for _,row in df.iterrows():
             c=str(row.get("代码","")).strip()
             if not c: continue
-            # 成交额原始单位为元，转换为亿
+            price=sf(row.get("最新价",row.get("现价",row.get("收盘价"))))
+            pct=sf(row.get("涨跌幅",row.get("日增长率")))
+            prem=sf(row.get("折溢价率",row.get("基金折价率",row.get("溢价率"))))
             raw_vol=sf(row.get("成交额",0)) or 0
-            vol_yi=round(raw_vol/1e8,2) if raw_vol>1e4 else raw_vol
-            # 规模直接是亿
-            aum=sf(row.get("规模",row.get("规模(亿)",None)))
-            r[c]={"price":sf(row.get("最新价")),"pct_chg":sf(row.get("涨跌幅")),
-                  "premium":sf(row.get("折溢价率")),"turnover_yi":vol_yi,"aum":aum}
-        print(f"[spot] {len(r)}只，样本列名: {list(df.columns[:8])}")
+            vol_yi=round(raw_vol/1e8,2) if raw_vol>1e6 else (raw_vol if raw_vol>0 else None)
+            aum=sf(row.get("规模",row.get("规模(亿)",row.get("基金规模(亿元)",row.get("资产净值")))))
+            shares=sf(row.get("基金份额(万份)",row.get("份额",row.get("总份额",row.get("基金份额")))))
+            if aum is None and shares and price:
+                aum=round(shares*price/10000,2)
+            r[c]={"price":price,"pct_chg":pct,"premium":prem,
+                  "turnover_yi":vol_yi,"aum":aum,"shares":shares}
+        print(f"[spot] {len(r)}只，aum非空: {sum(1 for v in r.values() if v.get('aum'))}")
         return r
     except Exception as e:
         print(f"[spot] 失败: {e}"); return {}
@@ -209,7 +217,13 @@ def api_products():
                     "premium":sp.get("premium"),"aum":sp.get("aum"),
                     "turnover_yi":sp.get("turnover_yi"),
                     "peer_rank":rank,"peer_total":len(peers)})
-    out.sort(key=lambda x:x.get("aum") or 0,reverse=True)
+    sort_by = request.args.get("sort","aum")
+    if sort_by == "pct_chg":
+        out.sort(key=lambda x: x.get("pct_chg") or -999, reverse=True)
+    elif sort_by == "pct_chg_asc":
+        out.sort(key=lambda x: x.get("pct_chg") or 999, reverse=False)
+    else:
+        out.sort(key=lambda x: x.get("aum") or 0, reverse=True)
     return jsonify(out)
 
 @app.route("/api/product/<code>")
@@ -443,6 +457,12 @@ tr:last-child td{border-bottom:none}tr:hover td{background:#faf9f7}
         <button class="btn pri" onclick="doRefresh()">刷新数据</button>
       </div>
     </div>
+    <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center">
+      <span style="font-size:12px;color:var(--mu)">排序：</span>
+      <button class="btn" id="sort-aum" onclick="setSort('aum')" style="font-size:11px;padding:4px 10px;background:var(--t);color:#f0ede6;border-color:var(--t)">规模↓</button>
+      <button class="btn" id="sort-up" onclick="setSort('pct_chg')" style="font-size:11px;padding:4px 10px">涨幅↓</button>
+      <button class="btn" id="sort-dn" onclick="setSort('pct_chg_asc')" style="font-size:11px;padding:4px 10px">跌幅↓</button>
+    </div>
     <div class="metrics">
       <div class="mc"><div class="ml">产品总数</div><div class="mv" id="m-cnt">—</div><div class="mn">鹏华场内ETF</div></div>
       <div class="mc"><div class="ml">今日平均涨跌</div><div class="mv" id="m-avg">—</div><div class="mn">等权平均</div></div>
@@ -570,9 +590,21 @@ async function doRefresh(){
     else if(r.status==='error'){clearInterval(iv);setSt('error','失败');toast('错误: '+r.error.slice(0,50),4000)}
   },2000);
 }
+let curSort='aum';
 async function loadProds(){
-  allP=await fetch('/api/products').then(r=>r.json());
+  allP=await fetch('/api/products?sort='+curSort).then(r=>r.json());
   fSb();rOv(allP);
+}
+function setSort(s){
+  curSort=s;
+  ['sort-aum','sort-up','sort-dn'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el){el.style.cssText='font-size:11px;padding:4px 10px'}
+  });
+  const m={'aum':'sort-aum','pct_chg':'sort-up','pct_chg_asc':'sort-dn'}[s];
+  const el=document.getElementById(m);
+  if(el) el.style.cssText='font-size:11px;padding:4px 10px;background:var(--t);color:#f0ede6;border-color:var(--t)';
+  loadProds();
 }
 function rOv(data){
   const cats=[...new Set(data.map(p=>p.category||p.board||'').filter(Boolean))].sort();
