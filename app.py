@@ -47,23 +47,26 @@ ALL_NAME=_CAT.get('all_code_name',{})
 ALL_MGR=_CAT.get('all_code_manager',{})
 
 # 指数名称->代码（用于拉历史行情）
+# 指数名称->新浪代码（用于拉历史行情，新浪接口全球可访问）
 INDEX_CODE={
-    "沪深300":"000300","中证500":"000905","中证1000":"000852","中证800":"000906",
-    "中证A500":"000510","中证A50":"000050","中证国防":"399973","中证银行":"399986",
-    "中证传媒":"399971","中证酒":"930782","中证中药":"000978","中证畜牧":"931579",
-    "中证现金流":"932365","800现金流":"932368","光伏产业":"931151","机器人产业":"980032",
-    "云计算":"930851","工业互联":"931142","CS车联网":"930899","细分化工":"000813",
-    "全指公用":"000270","内地低碳":"399989","科创50":"000688","科创100":"000698",
-    "科创200":"000699","科创综指":"000681","科创创业AI":"932000","科创新能":"000692",
-    "科创生物":"000683","科创芯片":"000685","科创芯片设计":"950125","创业板综":"399102",
-    "创业板50":"399673","创新能源":"399814","国证有色":"399395","国证粮食":"399294",
-    "国证油气":"399308","证券龙头":"399437","工业有色":"930708","食品":"000998",
-    "消费电子":"399994","疫苗生科":"399998","港股通科技":"931573","港股通消费":"931454",
-    "港股通医药C":"930965","港股通创新药":"931787","ESG 300":"931463","上证180":"000010",
-    "国证芯片(CNI)":"980017","中证800证保":"399966","中证电信":"930901",
-    "卫星产业":"932209","通用航空":"932210","工程机械主题":"931244","金融科技":"399699",
-    "科创AI":"000685","中证1000":"000852","科创半导体材料设备":"950125",
+    "沪深300":"sh000300","中证500":"sh000905","中证1000":"sh000852","中证800":"sh000906",
+    "中证A500":"sh000510","中证A50":"sh000050","中证国防":"sz399973","中证银行":"sz399986",
+    "中证传媒":"sz399971","中证酒":"sh930782","中证中药":"sh000978","中证畜牧":"sh931579",
+    "中证现金流":"sh932365","800现金流":"sh932368","光伏产业":"sh931151","机器人产业":"sz980032",
+    "云计算":"sh930851","工业互联":"sh931142","CS车联网":"sh930899","细分化工":"sh000813",
+    "全指公用":"sh000270","内地低碳":"sz399989","科创50":"sh000688","科创100":"sh000698",
+    "科创200":"sh000699","科创综指":"sh000681","科创创业AI":"sh932000","科创新能":"sh000692",
+    "科创生物":"sh000683","科创芯片":"sh000685","科创芯片设计":"sh950125","创业板综":"sz399102",
+    "创业板50":"sz399673","创新能源":"sz399814","国证有色":"sz399395","国证粮食":"sz399294",
+    "国证油气":"sz399308","证券龙头":"sz399437","工业有色":"sh930708","食品":"sh000998",
+    "消费电子":"sz399994","疫苗生科":"sz399998","港股通科技":"sh931573","港股通消费":"sh931454",
+    "港股通医药C":"sh930965","港股通创新药":"sh931787","ESG 300":"sh931463","上证180":"sh000010",
+    "国证芯片(CNI)":"sz980017","中证800证保":"sz399966","中证电信":"sh930901",
+    "卫星产业":"sh932209","通用航空":"sh932210","工程机械主题":"sh931244","金融科技":"sz399699",
+    "科创AI":"sh000685",
 }
+# 也保留纯数字代码映射（用于成分股接口）
+INDEX_CODE_NUM={k:v[2:] for k,v in INDEX_CODE.items()}
 HK_INDICES={"恒生科技","恒生指数","恒生生物科技","恒生中国央企指数","道琼斯工业平均",
             "标普港股通低波红利指数(港币)"}
 
@@ -152,38 +155,29 @@ def fetch_spot():
     except Exception as e:
         print(f"[spot] 失败: {e}"); return {}
 
-def fetch_perf(code):
-    """拉指数历史行情，计算各周期收益"""
-    if not code or code.startswith(('HS','DJI','SP','CN')): return None
+def fetch_perf(sina_code):
+    """用新浪接口拉指数历史行情（全球可访问）"""
+    if not sina_code or sina_code in ('','None'): return None
+    # 跳过港股/海外
+    if not sina_code.startswith(('sh','sz')): return None
     try:
         import akshare as ak
         import pandas as pd
-        from datetime import date as _date
-        end = _date.today()
-        start = end.replace(year=end.year-2)
-        df = ak.index_zh_a_hist(
-            symbol=code, period="daily",
-            start_date=start.strftime("%Y%m%d"),
-            end_date=end.strftime("%Y%m%d")
-        )
+        df = ak.stock_zh_index_daily(symbol=sina_code)
         if df is None or df.empty: return None
-        df = df.sort_values("日期")
-        c = df["收盘"].astype(float).values
-        if len(c) < 2: return None
-        def r(n): return round((c[-1]/c[-n]-1)*100, 2) if len(c) >= n else None
-        c1y = c[-252:] if len(c) >= 252 else c
-        cs = pd.Series(c1y)
-        roll = cs.cummax()
-        dd = round(((cs - roll) / roll).min() * 100, 2)
+        df = df.sort_values("date")
+        c = df["close"].astype(float).values
+        if len(c) < 5: return None
+        def r(n): return round((c[-1]/c[-n]-1)*100,2) if len(c)>=n else None
+        c1y = c[-252:] if len(c)>=252 else c
+        cs = pd.Series(c1y); roll = cs.cummax()
+        dd = round(((cs-roll)/roll).min()*100,2)
         mi = int(cs.idxmin())
-        bounce = round((c1y[-1]/c1y[mi]-1)*100, 2) if mi < len(c1y)-1 else 0
-        return {
-            "ret_1m": r(22), "ret_3m": r(63),
-            "ret_6m": r(126), "ret_1y": r(252),
-            "max_dd": dd, "bounce": bounce
-        }
+        bounce = round((c1y[-1]/c1y[mi]-1)*100,2) if mi<len(c1y)-1 else 0
+        return {"ret_1m":r(22),"ret_3m":r(63),"ret_6m":r(126),"ret_1y":r(252),
+                "max_dd":dd,"bounce":bounce}
     except Exception as e:
-        print(f"[perf] {code}: {e}")
+        print(f"[perf] {sina_code}: {e}")
         return None
 
 def fetch_cons(idx_code):
@@ -257,21 +251,18 @@ def fetch_all():
             peer_aum[idx_name]=peers
 
         # 3. 指数历史行情（并发拉取，跳过港股海外）
-        # 3. 指数历史行情（本地环境串行拉取；Railway跳过）
+        # 3. 指数历史行情（用新浪接口，全球可访问）
         print("[3/3] 拉取指数历史...")
-        # 通过PORT环境变量判断是否在Railway/云端（云端PORT由平台注入）
-        is_cloud = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
-        if is_cloud:
-            print("      云端环境，跳过指数历史（中国数据源访问受限）")
-            index_perf = {}
-        else:
-            codes_to_fetch = list({v for k,v in INDEX_CODE.items() if k not in HK_INDICES and v})
-            index_perf = {}
-            for ic in codes_to_fetch[:40]:
-                r = fetch_perf(ic)
-                if r: index_perf[ic] = r
-                time.sleep(0.3)
-            print(f"      获取{len(index_perf)}个指数")
+        sina_codes = list({v for k,v in INDEX_CODE.items()
+                           if k not in HK_INDICES and v and v.startswith(('sh','sz'))})
+        index_perf = {}
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = {ex.submit(fetch_perf, sc): sc for sc in sina_codes[:45]}
+            for fut in as_completed(futs):
+                sc = futs[fut]
+                r = fut.result()
+                if r: index_perf[sc] = r
+        print(f"      获取{len(index_perf)}个指数")
 
         with LK:
             C_["spot"]=spot; C_["peer_aum"]=peer_aum; C_["index_perf"]=index_perf
@@ -328,8 +319,9 @@ def api_product(code):
     with LK:
         sp=C_["spot"].get(code,{}); idx=p.get("index_name","")
         peers_rt=C_["peer_aum"].get(idx,[])
-        idx_code=INDEX_CODE.get(idx,"")
-        idx_perf=C_["index_perf"].get(idx_code,{})
+        idx_sina=INDEX_CODE.get(idx,"")
+        idx_code=INDEX_CODE_NUM.get(idx,"")  # 纯数字代码，用于成分股接口
+        idx_perf=C_["index_perf"].get(idx_sina,{})
         cons=C_["index_cons"].get(idx_code,{})
     # 同类排名
     cat=CODE_TO_CAT.get(code,"")
@@ -339,7 +331,11 @@ def api_product(code):
     is_hk=p.get("index_name","") in HK_INDICES
     if idx_code and not cons and not is_hk:
         threading.Thread(target=_bg_cons,args=(idx_code,),daemon=True).start()
-    return jsonify({"product":p,"spot":sp,"index_name":idx,"index_code":idx_code,
+    elif idx_sina and not idx_code and not cons and not is_hk:
+        # fallback: 用新浪代码的数字部分
+        threading.Thread(target=_bg_cons,args=(idx_sina[2:],),daemon=True).start()
+    return jsonify({"product":p,"spot":sp,"index_name":idx,
+                    "index_code":idx_code,"index_sina":idx_sina,
                     "index_perf":idx_perf,"cons":cons,"peers_rt":peers_rt[:12],
                     "dyn_peers":dyn_peers,"own_rank":own_rank,"category":cat,
                     "is_hk":is_hk,"last_update":C_.get("last_update","")})
@@ -383,8 +379,9 @@ def api_ai(code):
     if not p: return jsonify({"error":"产品不存在"})
     with LK:
         sp=C_["spot"].get(code,{}); idx=p.get("index_name","")
-        idx_code=INDEX_CODE.get(idx,"")
-        perf=C_["index_perf"].get(idx_code,{})
+        idx_sina=INDEX_CODE.get(idx,"")
+        idx_code=INDEX_CODE_NUM.get(idx,"")
+        perf=C_["index_perf"].get(idx_sina,{})
         cons=C_["index_cons"].get(idx_code,{})
         peers=C_["peer_aum"].get(idx,[])
     own_rank=next((i+1 for i,pe in enumerate(peers) if pe["code"]==code),None)
@@ -766,7 +763,7 @@ async function loadD(code){
     '<div class="mu-t">数据加载中</div>';
 
   // 指数表现
-  document.getElementById('d-idx-l').textContent=(data.index_name||'')+' ('+(data.index_code||'')+')';
+  document.getElementById('d-idx-l').textContent=(data.index_name||'')+' ('+(data.index_code||data.index_sina||'')+')';
   // 指数历史行情
   {
     const idxN = data.index_name||'';
@@ -839,21 +836,31 @@ async function loadD(code){
 }
 
 function rCons(cons){
-  document.getElementById('d-cons-l').textContent='更新: '+cons.date+(cons.equal_weight?' · 等权（无权重数据）':'');
+  const dateStr=cons.date||"";
+  const eqNote=cons.equal_weight?" · 等权（官网暂无权重）":"";
+  document.getElementById("d-cons-l").textContent="更新: "+dateStr+eqNote;
   const top10=cons.top10||[];
-  document.getElementById('d-cons').innerHTML=top10.length?(()=>{
-    const hasW=cons.has_weight;
-    const left=top10.slice(0,5), right=top10.slice(5,10);
-    const half2html=h=>h.map(s=>`<div class="bar-r">
-      <span style="color:var(--mu);font-family:var(--mono);font-size:10px;min-width:18px">${s.rank}</span>
-      <span style="min-width:72px;font-size:12px">${esc(s.name)}</span>
-      <div class="bar-bg"><div class="bar-f" style="width:${hasW&&s.weight?Math.min(s.weight*5,100):0}%"></div></div>
-      <span style="font-family:var(--mono);font-size:11px;min-width:40px;text-align:right">${hasW&&s.weight?s.weight.toFixed(2)+'%':'—'}</span>
-    </div>`).join('');
-    return `<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px">
-      <div>${half2html(left)}</div><div>${half2html(right)}</div></div>
-      ${!hasW?'<div style="font-size:11px;color:var(--mu);margin-top:8px">⚠️ 该指数暂无权重数据，仅显示成分股名称</div>':''}`;
-  })():'<div class="mu-t">成分股数据暂无</div>';
+  if(!top10.length){document.getElementById("d-cons").innerHTML='<div class="mu-t">成分股数据暂无</div>';return;}
+  function mkRow(s,num){
+    const w=typeof s.weight==="number"?s.weight:0;
+    const wStr=w>0?w.toFixed(3)+"%":"—";
+    const bw=Math.min(w*8,100);
+    return '<div class="bar-r">'+
+      '<span style="color:var(--mu);font-family:var(--mono);font-size:11px;min-width:18px;text-align:right">'+num+'</span>'+
+      '<span style="min-width:72px;font-size:12px;margin-left:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(s.name||"")+'</span>'+
+      '<div class="bar-bg" style="flex:1"><div class="bar-f" style="width:'+bw+'%"></div></div>'+
+      '<span style="font-family:var(--mono);font-size:11px;min-width:42px;text-align:right">'+wStr+'</span>'+
+      '</div>';
+  }
+  const left=top10.slice(0,5),right=top10.slice(5,10);
+  const leftHtml=left.map((s,i)=>mkRow(s,i+1)).join("");
+  const rightHtml=right.map((s,i)=>mkRow(s,i+6)).join("");
+  document.getElementById("d-cons").innerHTML=
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">'+
+    '<div>'+leftHtml+'</div>'+
+    '<div>'+rightHtml+'</div>'+
+    '</div>'+
+    '<div style="margin-top:8px;font-size:11px;color:var(--mu);font-family:var(--mono)">共'+(cons.total||top10.length)+'只成分股</div>';
 }
 
 function pollCons(idxCode){
